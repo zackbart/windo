@@ -121,7 +121,14 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           URL="https://github.com/zackbart/windo/releases/download/v$VERSION/Windo-$VERSION.dmg"
-          SHA=$(curl -fsSL "$URL" | sha256sum | awk '{print $1}')
+          # Download to a file with retries (asset may lag the release), then guard
+          # against an empty/missing download writing the empty-string hash into the cask.
+          curl -fSL --retry 6 --retry-delay 10 --retry-all-errors -o windo.dmg "$URL"
+          test -s windo.dmg || { echo "::error::downloaded dmg is empty"; exit 1; }
+          SHA=$(sha256sum windo.dmg | awk '{print $1}')
+          EMPTY=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+          [ "$SHA" = "$EMPTY" ] && { echo "::error::empty-file hash; aborting"; exit 1; }
+          rm windo.dmg
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/zackbart/homebrew-tap.git" tap
           cd tap
           sed -i -E "s|^  version \".*\"|  version \"$VERSION\"|" Casks/windo.rb
