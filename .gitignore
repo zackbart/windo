@@ -1,0 +1,10 @@
+# XcodeGen generates this from project.yml
+Windo.xcodeproj/
+
+# Build output
+build/
+DerivedData/
+*.dmg
+*.app
+
+.DS_Store

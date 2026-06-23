@@ -1,0 +1,133 @@
+name: Release
+
+# Tag-driven: push v0.1.0 (etc.) and this builds, signs, notarizes,
+# and publishes a Developer ID .dmg as a GitHub release, then bumps the
+# Homebrew cask. Version comes from the tag — never hand-edit MARKETING_VERSION.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    env:
+      SCHEME: Windo
+      PROJECT: Windo.xcodeproj
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i macos || true
+
+      - name: Install tools
+        run: brew install xcodegen create-dmg
+
+      - name: Import Developer ID certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/Windo.xcarchive" \
+            -destination 'generic/platform=macOS' \
+            MARKETING_VERSION=${{ steps.ver.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM=${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Export Developer ID app
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Windo.xcarchive" \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/export"
+
+      - name: Package DMG
+        id: dmg
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          DMG="$RUNNER_TEMP/Windo-$V.dmg"
+          create-dmg \
+            --volname "Windo $V" \
+            --window-size 540 380 \
+            --icon-size 100 \
+            --icon "Windo.app" 140 190 \
+            --app-drop-link 400 190 \
+            "$DMG" "$RUNNER_TEMP/export/Windo.app"
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize & staple
+        env:
+          AC_API_KEY_BASE64: ${{ secrets.AC_API_KEY_BASE64 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          echo "$AC_API_KEY_BASE64" | base64 --decode > "$KEY"
+          xcrun notarytool submit "${{ steps.dmg.outputs.path }}" \
+            --key "$KEY" --key-id "$AC_API_KEY_ID" --issuer "$AC_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "${{ steps.dmg.outputs.path }}"
+          rm "$KEY"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "${{ steps.dmg.outputs.path }}" \
+            --title "Windo ${{ steps.ver.outputs.version }}" \
+            --generate-notes
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bump Homebrew cask
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/zackbart/windo/releases/download/v$VERSION/Windo-$VERSION.dmg"
+          SHA=$(curl -fsSL "$URL" | sha256sum | awk '{print $1}')
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/zackbart/homebrew-tap.git" tap
+          cd tap
+          sed -i -E "s|^  version \".*\"|  version \"$VERSION\"|" Casks/windo.rb
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"$SHA\"|"       Casks/windo.rb
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/windo.rb
+          git diff --cached --quiet || git commit -m "windo $VERSION"
+          git push
