@@ -43,6 +43,13 @@ extension Notification.Name { static let windoToggle = Notification.Name("windoT
 
 struct Favorite: Codable { var name: String; var url: String }
 
+// One browser tab = one WKWebView. Title KVO keeps the tab label live.
+final class Tab {
+    let webView: WKWebView
+    var titleObs: NSKeyValueObservation?
+    init(webView: WKWebView) { self.webView = webView }
+}
+
 // Transparent overlay over the webview: hold Option to drag the window from
 // anywhere (the page itself otherwise swallows drag events, e.g. Plex).
 final class DragOverlay: NSView {
@@ -91,15 +98,20 @@ final class GlassBar: NSView {
     private let content = NSView()
     private let icon = NSImageView()
     private let controls: NSStackView
+    private let row: NSStackView
     private var widthC: NSLayoutConstraint!
     private let collapsedW: CGFloat = 40
-    private let expandedW: CGFloat
+    private let minExpandedW: CGFloat
     private let barH: CGFloat = 38
     private(set) var expanded = false
 
+    // Expanded width fits the controls (tabs make this variable), never below the minimum.
+    private var expandedW: CGFloat { max(minExpandedW, 11 + row.fittingSize.width + 14) }
+
     init(controls ctrls: [NSView], expandedWidth: CGFloat) {
         controls = NSStackView(views: ctrls)
-        expandedW = expandedWidth
+        minExpandedW = expandedWidth
+        row = NSStackView(views: [])
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
@@ -118,7 +130,7 @@ final class GlassBar: NSView {
         controls.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         controls.alphaValue = 0
 
-        let row = NSStackView(views: [icon, controls])
+        row.setViews([icon, controls], in: .leading)
         row.orientation = .horizontal
         row.spacing = 6
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -157,6 +169,18 @@ final class GlassBar: NSView {
         }
     }
 
+    // Tabs changed: regrow to fit the new content while open.
+    func relayout() {
+        guard expanded else { return }
+        layoutSubtreeIfNeeded()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            ctx.allowsImplicitAnimation = true
+            widthC.animator().constant = expandedW
+            superview?.layoutSubtreeIfNeeded()
+        }
+    }
+
     // Buttons/field take their own clicks; the handle and glass drag the window.
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard let hit = super.hitTest(point) else { return nil }
@@ -185,7 +209,11 @@ final class GlassBar: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, WKNavigationDelegate {
     var window: NSWindow!
-    var webView: WKWebView!
+    var tabs: [Tab] = []
+    var activeIndex = 0
+    var webView: WKWebView { tabs[activeIndex].webView }   // the visible tab
+    var webContainer: NSView!
+    var tabBar: NSStackView!
     var urlField: NSTextField!
     var muteButton: NSButton!
     var statusItem: NSStatusItem!
@@ -205,7 +233,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         opacity = CGFloat(UserDefaults.standard.object(forKey: "opacity") as? Double ?? 1.0)
         compact = UserDefaults.standard.bool(forKey: "compact")
         loadFavorites()
-        buildWebView()
         buildWindow()
         buildStatusItem()
         buildMainMenu()
@@ -213,10 +240,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         NotificationCenter.default.addObserver(self, selector: #selector(hotKeyToggle),
                                                name: .windoToggle, object: nil)
         window.alphaValue = opacity
+        addTab(url: UserDefaults.standard.string(forKey: "lastURL") ?? kDefaultURL, activate: true)
         setCompact(compact)
         showWindow()
         startTinting()
-        load(UserDefaults.standard.string(forKey: "lastURL") ?? kDefaultURL)
     }
 
     // MARK: - Ambient titlebar: tint the bar to the video's top-strip color
@@ -243,15 +270,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
 
     // MARK: - Web view
 
-    func buildWebView() {
+    func makeWebView() -> WKWebView {
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.allowsAirPlayForMediaPlayback = true
-        webView = WKWebView(frame: .zero, configuration: cfg)
-        webView.customUserAgent = kUserAgent
-        webView.allowsBackForwardNavigationGestures = true
-        webView.navigationDelegate = self
-        if #available(macOS 13.3, *) { webView.isInspectable = true }
+        let wv = WKWebView(frame: webContainer.bounds, configuration: cfg)
+        wv.autoresizingMask = [.width, .height]
+        wv.customUserAgent = kUserAgent
+        wv.allowsBackForwardNavigationGestures = true
+        wv.navigationDelegate = self
+        if #available(macOS 13.3, *) { wv.isInspectable = true }
+        return wv
+    }
+
+    // MARK: - Tabs
+
+    @objc func newTab() { addTab(url: kDefaultURL, activate: true) }
+    @objc func closeActiveTab() { closeTab(activeIndex) }
+    @objc func selectTabAction(_ s: NSButton) { selectTab(s.tag) }
+    @objc func closeTabAction(_ s: NSButton) { closeTab(s.tag) }
+
+    func addTab(url: String, activate: Bool) {
+        let wv = makeWebView()
+        wv.isHidden = true
+        webContainer.addSubview(wv, positioned: .below, relativeTo: nil)
+        let tab = Tab(webView: wv)
+        tab.titleObs = wv.observe(\.title) { [weak self] _, _ in self?.refreshTabBar() }
+        tabs.append(tab)
+        if activate { selectTab(tabs.count - 1) } else { refreshTabBar() }
+        wv.load(URLRequest(url: normalizedURL(url) ?? URL(string: kDefaultURL)!))
+    }
+
+    func selectTab(_ i: Int) {
+        guard tabs.indices.contains(i) else { return }
+        activeIndex = i
+        for (j, t) in tabs.enumerated() { t.webView.isHidden = (j != i) }
+        urlField.stringValue = webView.url?.absoluteString ?? ""
+        if muted { applyMute() }   // carry mute state onto the now-visible tab
+        refreshTabBar()
+    }
+
+    func closeTab(_ i: Int) {
+        guard tabs.count > 1, tabs.indices.contains(i) else { return }   // keep one tab alive
+        tabs[i].titleObs?.invalidate()
+        tabs[i].webView.removeFromSuperview()
+        tabs.remove(at: i)
+        if i < activeIndex { activeIndex -= 1 }
+        else if i == activeIndex { activeIndex = min(i, tabs.count - 1) }
+        selectTab(activeIndex)
+    }
+
+    func refreshTabBar() {
+        guard tabBar != nil else { return }
+        tabBar.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for (i, t) in tabs.enumerated() {
+            tabBar.addArrangedSubview(tabItem(index: i, title: t.webView.title, active: i == activeIndex))
+        }
+        let add = button("plus", #selector(newTab))
+        add.toolTip = "New Tab"
+        tabBar.addArrangedSubview(add)
+        glassBar?.relayout()   // grow the bar to fit the new tab count
+    }
+
+    func tabItem(index: Int, title: String?, active: Bool) -> NSView {
+        let name = (title?.isEmpty == false) ? title! : "New Tab"
+        let sel = HoverButton()
+        sel.isBordered = false
+        sel.title = name.count > 22 ? String(name.prefix(22)) + "…" : name
+        sel.font = .systemFont(ofSize: 11, weight: active ? .semibold : .regular)
+        sel.idleTint = active ? .labelColor : .secondaryLabelColor
+        sel.contentTintColor = sel.idleTint
+        sel.tag = index; sel.target = self; sel.action = #selector(selectTabAction(_:))
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 2
+        row.edgeInsets = NSEdgeInsets(top: 2, left: 8, bottom: 2, right: 4)
+        row.addArrangedSubview(sel)
+        if tabs.count > 1 {
+            let close = HoverButton()
+            close.isBordered = false
+            close.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+            close.idleTint = .secondaryLabelColor
+            close.contentTintColor = close.idleTint
+            close.tag = index; close.target = self; close.action = #selector(closeTabAction(_:))
+            close.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            row.addArrangedSubview(close)
+        }
+        if active {
+            row.wantsLayer = true
+            row.layer?.cornerRadius = 7
+            row.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
+        }
+        return row
     }
 
     // MARK: - Window (pure video; controls float on glass)
@@ -272,9 +384,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         window.isReleasedWhenClosed = false
 
         let container = NSView(frame: frame)
-        webView.frame = container.bounds
-        webView.autoresizingMask = [.width, .height]
-        container.addSubview(webView)
+        webContainer = NSView(frame: container.bounds)   // holds all tab webviews
+        webContainer.autoresizingMask = [.width, .height]
+        container.addSubview(webContainer)
         let overlay = DragOverlay(frame: container.bounds)
         overlay.autoresizingMask = [.width, .height]
         container.addSubview(overlay)
@@ -301,7 +413,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         urlField.cell?.isScrollable = true
         urlField.widthAnchor.constraint(equalToConstant: 160).isActive = true
 
-        glassBar = GlassBar(controls: [back, reload, urlField, muteButton], expandedWidth: 300)
+        tabBar = NSStackView()
+        tabBar.orientation = .horizontal
+        tabBar.spacing = 4
+
+        glassBar = GlassBar(controls: [back, reload, urlField, muteButton, tabBar], expandedWidth: 300)
         container.addSubview(glassBar)
         NSLayoutConstraint.activate([
             glassBar.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
@@ -442,9 +558,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
 
     // MARK: - Navigation
 
-    func load(_ raw: String) {
+    func normalizedURL(_ raw: String) -> URL? {
         var s = raw.trimmingCharacters(in: .whitespaces)
-        if s.isEmpty { return }
+        if s.isEmpty { return nil }
         if !s.contains("://") {
             if s.contains(" ") || !s.contains(".") {
                 s = "https://www.youtube.com/results?search_query=" +
@@ -453,9 +569,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
                 s = "https://" + s
             }
         }
-        guard let url = URL(string: s) else { return }
+        return URL(string: s)
+    }
+
+    func load(_ raw: String) {
+        guard let url = normalizedURL(raw) else { return }
         webView.load(URLRequest(url: url))
-        urlField.stringValue = s
+        urlField.stringValue = url.absoluteString
     }
 
     @objc func goBack() { webView.goBack() }
@@ -465,10 +585,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         glassBar.setExpanded(true)
         window.makeFirstResponder(urlField)
     }
+    // ponytail: JS mute — no public WKWebView mute API.
+    func applyMute() {
+        webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(m=>m.muted=\(muted))")
+    }
     @objc func toggleMute() {
         muted.toggle()
-        // ponytail: JS mute — no public WKWebView mute API.
-        webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(m=>m.muted=\(muted))")
+        applyMute()
         muteButton.image = NSImage(systemSymbolName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
                                    accessibilityDescription: nil)
     }
@@ -493,7 +616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     @objc func toggleCompact() { setCompact(!compact) }
     func setCompact(_ on: Bool) {
         compact = on
-        glassBar?.isHidden = on
+        glassBar?.isHidden = on   // glass bar (now incl. tabs) hides in compact
         // Compact reclaims the titlebar strip for full-bleed video.
         if on { window.styleMask.insert(.fullSizeContentView) }
         else  { window.styleMask.remove(.fullSizeContentView) }
@@ -512,8 +635,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
             NotificationCenter.default.post(name: .windoToggle, object: nil)
             return noErr
         }, 1, &spec, nil, nil)
-        // ⌥⌘W toggles the window from anywhere (global, no permission needed).
-        RegisterEventHotKey(UInt32(kVK_ANSI_W), UInt32(optionKey | cmdKey),
+        // ⌃⌘H toggles the window from anywhere (global, no permission needed).
+        // Not ⌥⌘H: that's the system "Hide Others" command and AppKit eats it
+        // while Windo is the front app.
+        RegisterEventHotKey(UInt32(kVK_ANSI_H), UInt32(controlKey | cmdKey),
                             id, GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
@@ -525,10 +650,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     // MARK: - WKNavigationDelegate (remember where we are)
 
     func webView(_ wv: WKWebView, didFinish nav: WKNavigation!) {
-        if let u = wv.url?.absoluteString {
+        guard let u = wv.url?.absoluteString else { return }
+        if wv === webView {                       // only the visible tab drives the URL field
             urlField.stringValue = u
             UserDefaults.standard.set(u, forKey: "lastURL")
         }
+        refreshTabBar()
     }
 
     // MARK: - URL field
@@ -548,6 +675,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let main = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "New Tab", action: #selector(newTab), keyEquivalent: "t").target = self
+        appMenu.addItem(withTitle: "Close Tab", action: #selector(closeActiveTab), keyEquivalent: "w").target = self
         appMenu.addItem(withTitle: "Focus URL", action: #selector(focusURL), keyEquivalent: "l").target = self
         appMenu.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "r").target = self
         appMenu.addItem(withTitle: "Add to Favorites", action: #selector(addFavorite), keyEquivalent: "d").target = self
