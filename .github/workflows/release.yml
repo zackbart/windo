@@ -106,8 +106,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Stable-named copy so releases/latest/download/Windo.dmg always
+          # resolves to the newest dmg (the README download button uses it).
+          STABLE="$RUNNER_TEMP/Windo.dmg"
+          cp "${{ steps.dmg.outputs.path }}" "$STABLE"
           gh release create "$GITHUB_REF_NAME" \
-            "${{ steps.dmg.outputs.path }}" \
+            "${{ steps.dmg.outputs.path }}" "$STABLE" \
             --title "Windo ${{ steps.ver.outputs.version }}" \
             --generate-notes
 

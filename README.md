@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zackbart/windo/releases/latest">
+  <a href="https://github.com/zackbart/windo/releases/latest/download/Windo.dmg">
     <img src="https://shieldcn.dev/badge/Download-Windo.dmg-blue.svg?logo=apple&size=lg" alt="Download the latest Windo.dmg">
   </a>
   <a href="https://github.com/zackbart/windo/releases/latest">
