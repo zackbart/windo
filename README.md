@@ -1,4 +1,23 @@
-# Windo
+<p align="center">
+  <a href="https://github.com/zackbart/windo">
+    <img src="https://shieldcn.dev/header/graph.svg?title=Windo&subtitle=floating+always-on-top+web+window+for+macOS&logo=apple&mode=light&align=center&font=geist-mono&border=false" alt="Windo">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/zackbart/windo/releases/latest">
+    <img src="https://shieldcn.dev/badge/Download-Windo.dmg-blue.svg?logo=apple&size=lg" alt="Download the latest Windo.dmg">
+  </a>
+  <a href="https://github.com/zackbart/windo/releases/latest">
+    <img src="https://shieldcn.dev/github/release/zackbart/windo.svg" alt="Latest release">
+  </a>
+  <a href="https://github.com/zackbart/windo/blob/main/LICENSE">
+    <img src="https://shieldcn.dev/github/license/zackbart/windo.svg" alt="License">
+  </a>
+  <a href="https://github.com/zackbart/windo/stargazers">
+    <img src="https://shieldcn.dev/github/stars/zackbart/windo.svg" alt="Stars">
+  </a>
+</p>
 
 A floating, always-on-top web window for macOS — watch YouTube, live sports, or
 any non-DRM web video on top of other apps, including over full-screen apps.
@@ -7,6 +26,8 @@ A menu-bar utility (no Dock icon). Liquid Glass control pill, ambient title bar
 that tints to the video, global hotkey, favorites, opacity, and compact mode.
 
 ## Install
+
+Grab the latest `.dmg` from [Releases](https://github.com/zackbart/windo/releases/latest), or install via Homebrew:
 
 ```bash
 brew install --cask zackbart/tap/windo
