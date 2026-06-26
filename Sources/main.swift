@@ -51,14 +51,20 @@ let kFullscreenShim = """
   var cur = null;
   var d = document, E = Element.prototype;
   var get = function () { return cur; };
-  ['fullscreenElement','webkitFullscreenElement'].forEach(function (p) {
+  // Override the FS-element getters. The native preference is on, so these are
+  // configurable accessors we can redefine to report our faked element.
+  ['fullscreenElement','webkitFullscreenElement','webkitCurrentFullScreenElement'].forEach(function (p) {
     try { Object.defineProperty(d, p, { get: get, configurable: true }); } catch (e) {}
   });
   d.fullscreenEnabled = d.webkitFullscreenEnabled = true;
   function fire() {
-    ['fullscreenchange','webkitfullscreenchange'].forEach(function (n) {
-      d.dispatchEvent(new Event(n));
-    });
+    // Native fires fullscreenchange asynchronously; sites attach handlers that
+    // expect that. Dispatch on the next tick so YouTube's listener is ready.
+    setTimeout(function () {
+      ['fullscreenchange','webkitfullscreenchange'].forEach(function (n) {
+        d.dispatchEvent(new Event(n));
+      });
+    }, 0);
   }
   function enter(el) { cur = el; el.classList.add('windo-fs'); fire(); }
   function leave() { if (cur) cur.classList.remove('windo-fs'); cur = null; fire(); }
@@ -66,9 +72,12 @@ let kFullscreenShim = """
   E.webkitRequestFullscreen = E.webkitRequestFullScreen = function () { enter(this); };
   d.exitFullscreen = function () { leave(); return Promise.resolve(); };
   d.webkitExitFullscreen = function () { leave(); };
+  // Esc exits, matching native fullscreen.
+  d.addEventListener('keydown', function (e) { if (e.key === 'Escape' && cur) leave(); }, true);
   var css = '.windo-fs{position:fixed!important;inset:0!important;width:100vw!important;' +
             'height:100vh!important;max-width:none!important;max-height:none!important;' +
-            'margin:0!important;z-index:2147483647!important;background:#000!important;}';
+            'margin:0!important;z-index:2147483647!important;background:#000!important;}' +
+            '.windo-fs video{width:100%!important;height:100%!important;}';
   var s = d.createElement('style'); s.textContent = css;
   (d.head || d.documentElement).appendChild(s);
 })();
@@ -307,8 +316,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.allowsAirPlayForMediaPlayback = true
-        // Fullscreen fills the Windo window, not the whole screen: shim the page's
-        // Fullscreen API so requestFullscreen just pins the element to fill the viewport.
+        // Native FS pref ON so the Fullscreen API surface exists and its getters are
+        // configurable — then the shim overrides requestFullscreen to fill the window
+        // (the webview) via CSS instead of letting WebKit take over the whole screen.
+        if #available(macOS 12.3, *) { cfg.preferences.isElementFullscreenEnabled = true }
         cfg.userContentController.addUserScript(
             WKUserScript(source: kFullscreenShim, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let wv = WKWebView(frame: webContainer.bounds, configuration: cfg)
