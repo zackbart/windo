@@ -48,36 +48,42 @@ extension Notification.Name { static let windoToggle = Notification.Name("windoT
 let kFullscreenShim = """
 (function () {
   if (window.__windoFS) return; window.__windoFS = true;
-  var cur = null;
-  var d = document, E = Element.prototype;
-  var get = function () { return cur; };
-  // Override the FS-element getters. The native preference is on, so these are
-  // configurable accessors we can redefine to report our faked element.
-  ['fullscreenElement','webkitFullscreenElement','webkitCurrentFullScreenElement'].forEach(function (p) {
-    try { Object.defineProperty(d, p, { get: get, configurable: true }); } catch (e) {}
-  });
-  d.fullscreenEnabled = d.webkitFullscreenEnabled = true;
+  var d = document, E = Element.prototype, cur = null;
+  function def(name, getter) {
+    try { Object.defineProperty(d, name, { get: getter, configurable: true }); } catch (e) {}
+  }
+  // Fake the Fullscreen API so the page believes it entered fullscreen; YouTube
+  // calls requestFullscreen on <html> and then resizes its own player to fill the
+  // window. We don't reparent or hard-size anything — just report state + fire the
+  // event, and let the site lay itself out.
+  def('fullscreenElement', function () { return cur; });
+  def('webkitFullscreenElement', function () { return cur; });
+  def('webkitCurrentFullScreenElement', function () { return cur; });
+  def('fullscreenEnabled', function () { return true; });
+  def('webkitFullscreenEnabled', function () { return true; });
+  def('webkitIsFullScreen', function () { return !!cur; });   // YouTube checks this one
+  function post(o) { try { window.webkit.messageHandlers.windo.postMessage(JSON.stringify(o)); } catch (e) {} }
   function fire() {
-    // Native fires fullscreenchange asynchronously; sites attach handlers that
-    // expect that. Dispatch on the next tick so YouTube's listener is ready.
-    setTimeout(function () {
-      ['fullscreenchange','webkitfullscreenchange'].forEach(function (n) {
-        d.dispatchEvent(new Event(n));
-      });
+    setTimeout(function () {   // native dispatches async; let listeners attach first
+      ['fullscreenchange','webkitfullscreenchange'].forEach(function (n) { d.dispatchEvent(new Event(n)); });
     }, 0);
   }
-  function enter(el) { cur = el; el.classList.add('windo-fs'); fire(); }
-  function leave() { if (cur) cur.classList.remove('windo-fs'); cur = null; fire(); }
+  function enter(el) { if (cur || !el) return; cur = el; el.classList && el.classList.add('windo-fs'); fire(); post({fs:true}); }
+  function leave() { if (!cur) return; cur.classList && cur.classList.remove('windo-fs'); cur = null; fire(); post({fs:false}); }
   E.requestFullscreen = function () { enter(this); return Promise.resolve(); };
   E.webkitRequestFullscreen = E.webkitRequestFullScreen = function () { enter(this); };
   d.exitFullscreen = function () { leave(); return Promise.resolve(); };
   d.webkitExitFullscreen = function () { leave(); };
-  // Esc exits, matching native fullscreen.
   d.addEventListener('keydown', function (e) { if (e.key === 'Escape' && cur) leave(); }, true);
-  var css = '.windo-fs{position:fixed!important;inset:0!important;width:100vw!important;' +
-            'height:100vh!important;max-width:none!important;max-height:none!important;' +
-            'margin:0!important;z-index:2147483647!important;background:#000!important;}' +
-            '.windo-fs video{width:100%!important;height:100%!important;}';
+  // Size with viewport units, not %, so the video doesn't collapse to 0 height
+  // against YouTube's unsized (faked-fullscreen) player container. object-fit
+  // keeps aspect / letterboxes against the black root.
+  var css = '.windo-fs{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;' +
+            'max-width:none!important;max-height:none!important;margin:0!important;overflow:hidden!important;background:#000!important;}' +
+            '.windo-fs #movie_player,.windo-fs .html5-video-player,.windo-fs .html5-video-container{' +
+            'left:0!important;top:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;}' +
+            '.windo-fs video{position:absolute!important;left:0!important;top:0!important;width:100vw!important;height:100vh!important;' +
+            'max-width:none!important;max-height:none!important;object-fit:contain!important;transform:none!important;}';
   var s = d.createElement('style'); s.textContent = css;
   (d.head || d.documentElement).appendChild(s);
 })();
@@ -249,7 +255,19 @@ final class GlassBar: NSView {
     @objc private func collapse() { setExpanded(false) }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, WKNavigationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+    var pageFullscreen = false
+    // The fullscreen shim posts {fs:true/false}. While a video is in (faked) page
+    // fullscreen, stop the ambient-tint takeSnapshot — snapshotting the hardware
+    // video layer blanks it (black picture, audio keeps playing).
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        guard m.name == "windo", let s = m.body as? String,
+              let data = s.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let fs = obj["fs"] as? Bool else { return }
+        pageFullscreen = fs
+    }
+
     var window: NSWindow!
     var tabs: [Tab] = []
     var activeIndex = 0
@@ -295,7 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         lerpTimer = Timer.scheduledTimer(withTimeInterval: 0.045, repeats: true) { [weak self] _ in self?.tickTint() }
     }
     func sampleTopColor() {
-        guard !compact, window.isVisible, webView.bounds.width > 1 else { return }
+        guard !compact, !pageFullscreen, window.isVisible, webView.bounds.width > 1 else { return }
         let cfg = WKSnapshotConfiguration()
         cfg.snapshotWidth = 64                      // downscale for speed
         webView.takeSnapshot(with: cfg) { [weak self] img, _ in
@@ -316,12 +334,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.allowsAirPlayForMediaPlayback = true
-        // Native FS pref ON so the Fullscreen API surface exists and its getters are
-        // configurable — then the shim overrides requestFullscreen to fill the window
-        // (the webview) via CSS instead of letting WebKit take over the whole screen.
+        // Native pref ON so the FS API surface exists and its getters are
+        // configurable (with it off, YouTube's button does nothing). The shim then
+        // overrides requestFullscreen and reparents into a clean fixed host so the
+        // video's compositing layer isn't blacked out.
         if #available(macOS 12.3, *) { cfg.preferences.isElementFullscreenEnabled = true }
         cfg.userContentController.addUserScript(
             WKUserScript(source: kFullscreenShim, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        cfg.userContentController.add(self, name: "windo")   // fullscreen state ← shim
         let wv = WKWebView(frame: webContainer.bounds, configuration: cfg)
         wv.autoresizingMask = [.width, .height]
         wv.customUserAgent = kUserAgent
