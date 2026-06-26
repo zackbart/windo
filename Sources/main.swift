@@ -47,6 +47,7 @@ struct Favorite: Codable { var name: String; var url: String }
 final class Tab {
     let webView: WKWebView
     var titleObs: NSKeyValueObservation?
+    var fsObs: NSKeyValueObservation?
     init(webView: WKWebView) { self.webView = webView }
 }
 
@@ -274,6 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.allowsAirPlayForMediaPlayback = true
+        if #available(macOS 12.3, *) { cfg.preferences.isElementFullscreenEnabled = true }  // YouTube et al. fullscreen button
         let wv = WKWebView(frame: webContainer.bounds, configuration: cfg)
         wv.autoresizingMask = [.width, .height]
         wv.customUserAgent = kUserAgent
@@ -296,6 +298,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         webContainer.addSubview(wv, positioned: .below, relativeTo: nil)
         let tab = Tab(webView: wv)
         tab.titleObs = wv.observe(\.title) { [weak self] _, _ in self?.refreshTabBar() }
+        // Element fullscreen: WebKit hoists the webview into its own window. Our
+        // .floating window would draw on top of it, so step aside while in fullscreen.
+        if #available(macOS 13.0, *) {
+            tab.fsObs = wv.observe(\.fullscreenState) { [weak self] wv, _ in
+                self?.fullscreenChanged(wv.fullscreenState)
+            }
+        }
         tabs.append(tab)
         if activate { selectTab(tabs.count - 1) } else { refreshTabBar() }
         wv.load(URLRequest(url: normalizedURL(url) ?? URL(string: kDefaultURL)!))
@@ -313,6 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     func closeTab(_ i: Int) {
         guard tabs.count > 1, tabs.indices.contains(i) else { return }   // keep one tab alive
         tabs[i].titleObs?.invalidate()
+        tabs[i].fsObs?.invalidate()
         tabs[i].webView.removeFromSuperview()
         tabs.remove(at: i)
         if i < activeIndex { activeIndex -= 1 }
@@ -449,6 +459,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         window.collectionBehavior = pinned
             ? [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
             : [.fullScreenAuxiliary]
+    }
+
+    // While a video is in element fullscreen, drop out of .floating so WebKit's
+    // fullscreen window isn't covered by ours. Restore the pin state on exit.
+    @available(macOS 13.0, *)
+    func fullscreenChanged(_ state: WKWebView.FullscreenState) {
+        switch state {
+        case .enteringFullscreen, .inFullscreen:
+            window.level = .normal
+        case .exitingFullscreen, .notInFullscreen:
+            applyPin()
+        @unknown default:
+            applyPin()
+        }
     }
 
     // MARK: - Menu-bar item
