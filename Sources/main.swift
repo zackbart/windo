@@ -41,13 +41,45 @@ let kUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/60
 
 extension Notification.Name { static let windoToggle = Notification.Name("windoToggle") }
 
+// Make the page's Fullscreen API fill the webview (= the Windo window) instead of
+// the screen. We replace requestFullscreen/exitFullscreen with CSS that pins the
+// element to the viewport, and fake fullscreenElement + fullscreenchange so sites
+// like YouTube believe the request succeeded.
+let kFullscreenShim = """
+(function () {
+  if (window.__windoFS) return; window.__windoFS = true;
+  var cur = null;
+  var d = document, E = Element.prototype;
+  var get = function () { return cur; };
+  ['fullscreenElement','webkitFullscreenElement'].forEach(function (p) {
+    try { Object.defineProperty(d, p, { get: get, configurable: true }); } catch (e) {}
+  });
+  d.fullscreenEnabled = d.webkitFullscreenEnabled = true;
+  function fire() {
+    ['fullscreenchange','webkitfullscreenchange'].forEach(function (n) {
+      d.dispatchEvent(new Event(n));
+    });
+  }
+  function enter(el) { cur = el; el.classList.add('windo-fs'); fire(); }
+  function leave() { if (cur) cur.classList.remove('windo-fs'); cur = null; fire(); }
+  E.requestFullscreen = function () { enter(this); return Promise.resolve(); };
+  E.webkitRequestFullscreen = E.webkitRequestFullScreen = function () { enter(this); };
+  d.exitFullscreen = function () { leave(); return Promise.resolve(); };
+  d.webkitExitFullscreen = function () { leave(); };
+  var css = '.windo-fs{position:fixed!important;inset:0!important;width:100vw!important;' +
+            'height:100vh!important;max-width:none!important;max-height:none!important;' +
+            'margin:0!important;z-index:2147483647!important;background:#000!important;}';
+  var s = d.createElement('style'); s.textContent = css;
+  (d.head || d.documentElement).appendChild(s);
+})();
+"""
+
 struct Favorite: Codable { var name: String; var url: String }
 
 // One browser tab = one WKWebView. Title KVO keeps the tab label live.
 final class Tab {
     let webView: WKWebView
     var titleObs: NSKeyValueObservation?
-    var fsObs: NSKeyValueObservation?
     init(webView: WKWebView) { self.webView = webView }
 }
 
@@ -275,7 +307,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
         cfg.allowsAirPlayForMediaPlayback = true
-        if #available(macOS 12.3, *) { cfg.preferences.isElementFullscreenEnabled = true }  // YouTube et al. fullscreen button
+        // Fullscreen fills the Windo window, not the whole screen: shim the page's
+        // Fullscreen API so requestFullscreen just pins the element to fill the viewport.
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: kFullscreenShim, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         let wv = WKWebView(frame: webContainer.bounds, configuration: cfg)
         wv.autoresizingMask = [.width, .height]
         wv.customUserAgent = kUserAgent
@@ -298,13 +333,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         webContainer.addSubview(wv, positioned: .below, relativeTo: nil)
         let tab = Tab(webView: wv)
         tab.titleObs = wv.observe(\.title) { [weak self] _, _ in self?.refreshTabBar() }
-        // Element fullscreen: WebKit hoists the webview into its own window. Our
-        // .floating window would draw on top of it, so step aside while in fullscreen.
-        if #available(macOS 13.0, *) {
-            tab.fsObs = wv.observe(\.fullscreenState) { [weak self] wv, _ in
-                self?.fullscreenChanged(wv.fullscreenState)
-            }
-        }
         tabs.append(tab)
         if activate { selectTab(tabs.count - 1) } else { refreshTabBar() }
         wv.load(URLRequest(url: normalizedURL(url) ?? URL(string: kDefaultURL)!))
@@ -322,7 +350,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
     func closeTab(_ i: Int) {
         guard tabs.count > 1, tabs.indices.contains(i) else { return }   // keep one tab alive
         tabs[i].titleObs?.invalidate()
-        tabs[i].fsObs?.invalidate()
         tabs[i].webView.removeFromSuperview()
         tabs.remove(at: i)
         if i < activeIndex { activeIndex -= 1 }
@@ -459,20 +486,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, W
         window.collectionBehavior = pinned
             ? [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
             : [.fullScreenAuxiliary]
-    }
-
-    // While a video is in element fullscreen, drop out of .floating so WebKit's
-    // fullscreen window isn't covered by ours. Restore the pin state on exit.
-    @available(macOS 13.0, *)
-    func fullscreenChanged(_ state: WKWebView.FullscreenState) {
-        switch state {
-        case .enteringFullscreen, .inFullscreen:
-            window.level = .normal
-        case .exitingFullscreen, .notInFullscreen:
-            applyPin()
-        @unknown default:
-            applyPin()
-        }
     }
 
     // MARK: - Menu-bar item
